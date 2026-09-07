@@ -136,6 +136,8 @@ export class RemoteChannel {
     private statusWriteChain: Promise<void> = Promise.resolve();
     /** Tokens from the last setSession / TOKEN_REFRESHED, for setOffline(). */
     private lastKnownSession: { access_token: string; refresh_token: string | null } | null = null;
+    /** Device-owned durable persistence hook. Token values are never logged. */
+    private sessionChangedHandler: ((session: AuthSession | null) => void | Promise<void>) | null = null;
     /** Set by unsubscribe(): suppresses status/heartbeat writes so they can't
      * land after setOffline()'s durable write. */
     private shuttingDown = false;
@@ -184,6 +186,50 @@ export class RemoteChannel {
     private _user: User | null = null;
     get user(): User | null { return this._user; }
 
+    /** Register the device-owned durable session writer/invalidator. */
+    onSessionChanged(handler: (session: AuthSession | null) => void | Promise<void>): void {
+        this.sessionChangedHandler = handler;
+    }
+
+    /** Cache and publish a current token pair without ever logging its values. */
+    private async rememberSession(
+        session: Pick<AuthSession, 'access_token' | 'refresh_token'>
+    ): Promise<void> {
+        const snapshot: AuthSession = {
+            access_token: session.access_token,
+            refresh_token: session.refresh_token ?? null,
+        };
+        this.lastKnownSession = snapshot;
+
+        const handler = this.sessionChangedHandler;
+        if (!handler) return;
+        try {
+            await handler({ ...snapshot });
+        } catch (error: any) {
+            console.error('[DEBUG] Durable session persistence failed:', error?.message);
+            void captureRemote('remote_channel_session_persist_error', {
+                errorName: error?.name ?? null,
+                errorMessage: error?.message ?? null,
+            }).catch(() => { });
+        }
+    }
+
+    /** Remove a token family that the auth server has definitively rejected. */
+    private async forgetSession(): Promise<void> {
+        this.lastKnownSession = null;
+        const handler = this.sessionChangedHandler;
+        if (!handler) return;
+        try {
+            await handler(null);
+        } catch (error: any) {
+            console.error('[DEBUG] Durable session invalidation failed:', error?.message);
+            void captureRemote('remote_channel_session_persist_error', {
+                operation: 'invalidate',
+                errorName: error?.name ?? null,
+                errorMessage: error?.message ?? null,
+            }).catch(() => { });
+        }
+    }
 
     initialize(url: string, key: string): void {
         // autoRefreshToken:false — we drive refresh ourselves (startTokenRefresh(),
@@ -294,11 +340,12 @@ export class RemoteChannel {
         const { data: { session: currentSession } } = await this.client.auth.getSession();
         const realtimeToken = currentSession?.access_token ?? session.access_token;
         this.client.realtime.setAuth(realtimeToken);
-        // Cached for setOffline(), which can't afford to wait on getSession().
-        this.lastKnownSession = {
+        // Cached for setOffline() and persisted immediately: setSession() may
+        // rotate the refresh token even during an otherwise successful restart.
+        await this.rememberSession({
             access_token: realtimeToken,
             refresh_token: currentSession?.refresh_token ?? session.refresh_token ?? null,
-        };
+        });
         console.debug('[DEBUG] Realtime socket authorized with current session JWT');
         if (!this.authListenerRegistered) {
             this.authListenerRegistered = true;
@@ -306,10 +353,10 @@ export class RemoteChannel {
                 if (event === 'TOKEN_REFRESHED' && newSession?.access_token && this.client) {
                     console.debug('[DEBUG] Token refreshed — re-authorizing realtime socket');
                     this.client.realtime.setAuth(newSession.access_token);
-                    this.lastKnownSession = {
+                    void this.rememberSession({
                         access_token: newSession.access_token,
                         refresh_token: newSession.refresh_token ?? this.lastKnownSession?.refresh_token ?? null,
-                    };
+                    });
                 } else if (event === 'SIGNED_OUT') {
                     void this.handleSignedOut();
                 }
@@ -351,10 +398,10 @@ export class RemoteChannel {
                         if (!restoreError) {
                             const renewed = data?.session;
                             if (renewed?.access_token) {
-                                this.lastKnownSession = {
+                                await this.rememberSession({
                                     access_token: renewed.access_token,
                                     refresh_token: renewed.refresh_token ?? cached.refresh_token,
-                                };
+                                });
                             }
                             console.log('   - ✅ Remote session restored after a transient sign-out');
                             await captureRemote('remote_channel_signed_out_recovered', {});
@@ -399,6 +446,12 @@ export class RemoteChannel {
             try {
                 await this.setOffline(this.deviceId ?? undefined);
             } catch { /* best effort */ }
+
+            // The auth server has definitively rejected this token family. Clear
+            // its durable copy only after setOffline() has used the cached token,
+            // so a supervisor restart cannot replay the revoked credentials and
+            // reopen the same device-confirmation flow indefinitely.
+            await this.forgetSession();
 
             console.error('\n⚠️  Remote session expired and could not be renewed.');
             console.error('   This device is now offline for remote calls; local tools still work.');

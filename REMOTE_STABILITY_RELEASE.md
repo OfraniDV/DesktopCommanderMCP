@@ -1,4 +1,4 @@
-# Remote stability release: 0.2.49-odulami.1
+# Remote stability release: 0.2.49-odulami.2
 
 Date: 2026-09-07
 Distribution: OfraniDV GitHub fork build (not an upstream npm release)
@@ -49,6 +49,26 @@ The writer now retries only `EPERM`, `EACCES`, and `EBUSY` on Windows, using the
 same completed temporary file. It never falls back to an in-place write, so
 readers still see either the old complete JSON or the new complete JSON.
 
+## Durable remote-session rotation
+
+The Windows supervisor already starts the connector in the correct user profile
+and hidden mode. The confirmation window was not caused by a missing UI click:
+Supabase can rotate a refresh token while the connector is running, but the
+previous implementation persisted the session only once during startup. A later
+restart could therefore replay an obsolete token and open the browser/device
+confirmation flow again.
+
+Version 0.2.49-odulami.2 persists every accepted token rotation immediately,
+serially, and through an atomic replacement of `device.json`. Successful
+`setSession`, `TOKEN_REFRESHED`, and transient `SIGNED_OUT` recovery all update
+the durable copy. A definitively rejected token family is removed, and queued
+callbacks from that obsolete family cannot recreate it after revocation.
+
+Normal service or Windows restarts should now restore the existing authorized
+session without opening a browser, requesting a code, or waiting for a button.
+A genuinely revoked device still requires one legitimate approval; that security
+boundary is intentionally not bypassed by an automated UI click.
+
 ## Recovery settings
 
 Defaults are intentionally bounded and can be overridden for diagnostics:
@@ -72,8 +92,26 @@ intentional process shutdown; it does not enter a tight respawn loop.
 - execution health gates Presence, capability, heartbeat, and online status;
 - transient startup failures are retried by one serialized recovery loop.
 
+`test/test-remote-session-persistence.js` verifies that every accepted rotation
+reaches the durable writer, the newest token pair survives a simulated restart,
+revocation wins over queued stale writes, and definitive session loss invalidates
+the durable copy.
+
 The existing atomic-write stress test verifies that concurrent readers never see
 partial JSON while the Windows retry path is active.
+
+## Release validation
+
+- clean `npm ci` and TypeScript/UI build completed successfully;
+- the affected gate passed session persistence, `SIGNED_OUT`, reconnection,
+  local-child self-healing, remote transport, and atomic configuration tests;
+- the repository-wide Windows runner completed 57/60 modules. Its three failures
+  are unchanged harness limitations outside this release: a POSIX-only Python
+  REPL test and two pre-existing completed-process/pagination timing tests.
+
+The three failing test files and the process manager they exercise are unchanged
+by 0.2.49-odulami.2. The new session test was discovered by the global runner and
+passed there as well as in the focused gate.
 
 ## Release and deployment policy
 
@@ -81,7 +119,8 @@ This fork build is distributed as a GitHub release tarball and is deliberately
 marked `private` in `package.json`. It is not published to npm and does not claim
 to replace the upstream `@wonderwhy-er/desktop-commander` release.
 
-Production installation uses the release tarball by absolute path. Before
-installation, preserve the official `0.2.48` npm tarball and the active systemd
-unit. Restart only `desktop-commander-remote.service`; never use a global PM2 or
-host restart for this deployment.
+Production Windows installation uses the release tarball by absolute path.
+Before installation, preserve the official `0.2.48` package and the scheduled
+task definitions. Restart only `DesktopCommanderRemoteUser`; do not restart the
+host or unrelated services. Linux deployments preserve their service unit and
+restart only the Desktop Commander remote service.
