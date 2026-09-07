@@ -1,16 +1,16 @@
 {
   "name": "@wonderwhy-er/desktop-commander",
-  "version": "0.2.48",
+  "version": "0.2.49-odulami.1",
   "description": "MCP server for terminal operations and file editing",
   "mcpName": "io.github.wonderwhy-er/desktop-commander",
   "license": "MIT",
   "author": "Eduards Ruzga",
-  "homepage": "https://github.com/wonderwhy-er/DesktopCommanderMCP",
+  "homepage": "https://github.com/OfraniDV/DesktopCommanderMCP",
   "repository": {
     "type": "git",
-    "url": "https://github.com/wonderwhy-er/DesktopCommanderMCP.git"
+    "url": "https://github.com/OfraniDV/DesktopCommanderMCP.git"
   },
-  "bugs": "https://github.com/wonderwhy-er/DesktopCommanderMCP/issues",
+  "bugs": "https://github.com/OfraniDV/DesktopCommanderMCP/issues",
   "type": "module",
   "engines": {
     "node": ">=18.0.0"
@@ -141,5 +141,7 @@
     "ts-node": "^10.9.2",
     "tsx": "^4.21.0",
     "typescript": "^5.3.3"
-  }
+  },
+  "private": true,
+  "distribution": "OfraniDV GitHub stability build; not the upstream npm release"
 }

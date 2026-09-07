@@ -153,6 +153,9 @@ export class RemoteChannel {
     /** False when presence publishing failed on an otherwise healthy channel;
      * the health check retries, since SUBSCRIBED won't fire again. */
     private presenceTracked = false;
+    /** The remote socket alone is insufficient: tools are dispatchable only
+     * while the local Desktop Commander child is also alive. */
+    private executionReady = true;
     /** Last capability value written (null = never), to avoid redundant writes. */
     private transportCapableWritten: boolean | null = null;
     /** Re-entrancy guard: on a wedged socket each track() buffers for the full
@@ -215,6 +218,43 @@ export class RemoteChannel {
                 });
             } catch { /* no onHeartbeat on this client version: staleness check stays inert */ }
         }
+    }
+
+    /**
+     * Publish local execution health into the remote reachability model.
+     *
+     * When the stdio child dies we immediately stop Presence, withdraw the
+     * broadcast capability and stop heartbeat/status writes from claiming the
+     * device is usable. Recovery restores Presence only after the child is live.
+     */
+    async setExecutionReady(ready: boolean): Promise<void> {
+        if (this.executionReady === ready) return;
+
+        this.executionReady = ready;
+
+        if (!ready) {
+            this.presenceTracked = false;
+            this.syncReachabilityStatus();
+
+            if (this.channel?.state === 'joined') {
+                try {
+                    const status = await this.channel.untrack();
+                    if (status !== 'ok') {
+                        console.debug(`[DEBUG] Presence untrack not acknowledged (${status})`);
+                    }
+                } catch (error: any) {
+                    console.debug(`[DEBUG] Presence untrack failed: ${error?.message}`);
+                }
+            }
+
+            await this.setTransportCapable(false);
+            return;
+        }
+
+        if (this.channel?.state === 'joined') {
+            await this.trackPresenceWithRetry(0, 2);
+        }
+        this.syncReachabilityStatus();
     }
 
     async setSession(session: AuthSession): Promise<{ error: any }> {
@@ -486,8 +526,9 @@ export class RemoteChannel {
     }
 
     private async trackPresenceInner(recovered: number, attempts: number): Promise<void> {
+        if (!this.executionReady) return;
         for (let attempt = 1; attempt <= attempts; attempt++) {
-            if (!this.channel || this.channel.state !== 'joined') return;
+            if (!this.executionReady || !this.channel || this.channel.state !== 'joined') return;
             let status: string;
             try {
                 status = await this.channel.track({
@@ -611,9 +652,19 @@ export class RemoteChannel {
                         this.reconnectAttempt = 0;
                         this.lastHeartbeatOkAt = performance.now(); // a fresh join is proof of life too
                         console.log(`✅ Channel subscribed${recovered > 0 ? ` (recovered after ${recovered} attempt${recovered === 1 ? '' : 's'})` : ''}`);
-                        // Update device status on successful connection (queued, so
-                        // it can't be overtaken by a teardown's status write).
-                        this.queueStatusWrite('online');
+                        // Online requires BOTH the remote channel and the
+                        // local execution child. A resubscribe must not advertise
+                        // a device whose stdio worker is still recovering.
+                        this.syncReachabilityStatus();
+
+                        if (!this.executionReady) {
+                            this.presenceTracked = false;
+                            this.setTransportCapable(false)
+                                .catch(() => { /* logged inside */ })
+                                .finally(() => resolve());
+                            return;
+                        }
+
                         // Presence is the live signal dispatch reads, so resolve
                         // only once it lands — otherwise registerDevice() reports
                         // "Device ready" while still undispatchable.
@@ -797,7 +848,7 @@ export class RemoteChannel {
             // Self-heal a failed presence publish: the channel is up, so nothing
             // else will ever retry (SUBSCRIBED won't fire again), and without
             // presence the server reports this healthy device as offline.
-            if (!this.presenceTracked && this.deviceId && !this.isTrackingPresence) {
+            if (this.executionReady && !this.presenceTracked && this.deviceId && !this.isTrackingPresence) {
                 console.debug('[DEBUG] Channel joined but presence not tracked — retrying track()');
                 this.trackPresenceWithRetry(0, 1).catch(() => { /* logged inside */ });
             }
@@ -1059,9 +1110,9 @@ export class RemoteChannel {
         }
     }
 
-    /** Reachable means the private channel is joined. Gates the heartbeat and `status`. */
+    /** Reachable means both transport and local execution are usable. */
     private isReachable(): boolean {
-        return this.channel?.state === 'joined';
+        return this.executionReady && this.channel?.state === 'joined';
     }
 
     /**

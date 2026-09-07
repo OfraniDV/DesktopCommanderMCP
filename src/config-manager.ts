@@ -213,7 +213,23 @@ class ConfigManager {
     const tempPath = `${this.configPath}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
     try {
       await fs.writeFile(tempPath, JSON.stringify(config, null, 2), 'utf8');
-      await fs.rename(tempPath, this.configPath);
+
+      // On Windows, a reader or antivirus can hold a short-lived handle that
+      // makes an otherwise valid atomic replacement fail with EPERM/EACCES or
+      // EBUSY. Retrying the SAME rename preserves the commit boundary and is
+      // safer than falling back to an in-place write, which could expose
+      // truncated JSON to concurrent readers.
+      const maxAttempts = os.platform() === 'win32' ? 50 : 1;
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+          await fs.rename(tempPath, this.configPath);
+          break;
+        } catch (error: any) {
+          const transient = ['EPERM', 'EACCES', 'EBUSY'].includes(error?.code);
+          if (!transient || attempt === maxAttempts) throw error;
+          await new Promise((resolve) => setTimeout(resolve, Math.min(5 * attempt, 100)));
+        }
+      }
     } finally {
       await fs.unlink(tempPath).catch(() => {});
     }

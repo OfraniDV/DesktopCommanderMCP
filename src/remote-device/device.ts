@@ -38,6 +38,11 @@ export class MCPDevice {
     private desktop: DesktopCommanderIntegration;
     /** Call ids already handled by THIS process (insertion-ordered, bounded). */
     private seenCallIds: Set<string> = new Set();
+    /** One serialized recovery loop for the local stdio child. */
+    private localRecoveryPromise: Promise<void> | null = null;
+    /** Backoff survives quick crash/recovery cycles and resets after stable uptime. */
+    private localRestartAttempt = 0;
+    private localMcpStableSince = 0;
 
     constructor(options: MCPDeviceOptions = {}) {
         this.baseServerUrl = process.env.MCP_SERVER_URL || 'https://mcp.desktopcommander.app';
@@ -119,6 +124,7 @@ export class MCPDevice {
             // Initialize desktop integration
             await this.desktop.initialize();
             this.desktop.onDisconnect((reason) => void this.handleLocalMcpLoss(reason));
+            this.localMcpStableSince = Date.now();
 
             console.log(`⏳ Connecting to Remote MCP ${this.baseServerUrl}`);
             const { supabaseUrl, anonKey } = await this.fetchSupabaseConfig();
@@ -336,24 +342,77 @@ export class MCPDevice {
      * reporting itself online and every routed tool call came back "Not
      * connected" until someone restarted the process by hand.
      */
-    private async handleLocalMcpLoss(reason: string) {
-        if (this.deviceId) {
-            await this.remoteChannel.setOnlineStatus(this.deviceId, 'offline')
-                .catch((e: any) => console.error('Failed to mark device offline:', e.message));
+    private async handleLocalMcpLoss(reason: string): Promise<void> {
+        if (this.isShuttingDown) return;
+
+        // Concurrent close/error signals and a tool-call-side reconnect share a
+        // single recovery loop. Without this, duplicate events spawn competing
+        // children and contradictory online/offline writes.
+        if (this.localRecoveryPromise) {
+            await this.localRecoveryPromise;
+            return;
         }
 
-        // Recover proactively rather than waiting for the next tool call to
-        // trigger the lazy restart: we just went offline, so no further calls
-        // would be routed here and that wait would never end.
-        try {
-            await this.desktop.ensureReady();
-            if (this.deviceId) {
-                await this.remoteChannel.setOnlineStatus(this.deviceId, 'online');
+        // Mark execution unavailable immediately. The method flips its in-memory
+        // gate synchronously before any network await, so no new Presence or
+        // heartbeat can re-advertise a dead child.
+        void this.remoteChannel.setExecutionReady(false)
+            .catch((error: any) =>
+                console.error(`Failed to publish local MCP loss: ${error?.message}`));
+
+        this.localRecoveryPromise = this.recoverLocalMcp(reason).finally(() => {
+            this.localRecoveryPromise = null;
+        });
+        await this.localRecoveryPromise;
+    }
+
+    private async recoverLocalMcp(reason: string): Promise<void> {
+        const positiveEnv = (name: string, fallback: number): number => {
+            const parsed = Number(process.env[name]);
+            return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+        };
+        const baseMs = positiveEnv('DC_LOCAL_RESTART_BACKOFF_BASE_MS', 1000);
+        const maxMs = positiveEnv('DC_LOCAL_RESTART_BACKOFF_MAX_MS', 30000);
+        const stableMs = positiveEnv('DC_LOCAL_RESTART_STABLE_UPTIME_MS', 60000);
+
+        if (!this.localMcpStableSince || Date.now() - this.localMcpStableSince >= stableMs) {
+            this.localRestartAttempt = 0;
+        }
+
+        while (!this.isShuttingDown) {
+            const exponent = Math.min(this.localRestartAttempt, 16);
+            const delayMs = Math.min(baseMs * 2 ** exponent, maxMs);
+            const jitterMs = Math.floor(Math.random() * Math.max(1, delayMs * 0.15));
+            const attempt = ++this.localRestartAttempt;
+
+            console.log(
+                `♻️  Restarting local Desktop Commander MCP in ${delayMs + jitterMs}ms ` +
+                `(attempt ${attempt})`
+            );
+            await new Promise(resolve => setTimeout(resolve, delayMs + jitterMs));
+            if (this.isShuttingDown) return;
+
+            try {
+                // If an in-flight tool already performed the safe on-demand
+                // reconnect, ensureReady() is a cheap no-op here.
+                await this.desktop.ensureReady();
+                this.localMcpStableSince = Date.now();
+                await this.remoteChannel.setExecutionReady(true);
+                console.log(
+                    `✅ Local Desktop Commander MCP recovered on attempt ${attempt}; device is executable`
+                );
+                void captureRemote('remote_device_local_mcp_recovered', { reason, attempt })
+                    .catch(() => { /* recovery must not depend on telemetry */ });
+                return;
+            } catch (error: any) {
+                console.error(`❌ Local MCP restart attempt ${attempt} failed: ${error?.message}`);
+                void captureRemote('remote_device_local_mcp_restart_failed', {
+                    error,
+                    reason,
+                    attempt,
+                    nextDelayMaxMs: Math.min(delayMs * 2, maxMs),
+                }).catch(() => { /* recovery must not depend on telemetry */ });
             }
-            console.log('♻️  Local Desktop Commander MCP restarted; device is online again');
-        } catch (error: any) {
-            console.error(`❌ Could not restart local Desktop Commander MCP: ${error.message}`);
-            await captureRemote('remote_device_local_mcp_restart_failed', { error, reason });
         }
     }
 

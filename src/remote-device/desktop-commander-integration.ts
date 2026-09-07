@@ -26,7 +26,7 @@ export class DesktopCommanderIntegration {
 
     /** True only while the local stdio child is actually reachable. */
     get ready(): boolean {
-        return this.isReady && this.mcpClient !== null;
+        return this.isReady && this.mcpClient !== null && this.mcpTransport !== null;
     }
 
     /**
@@ -45,13 +45,30 @@ export class DesktopCommanderIntegration {
      * and died inside the SDK with a bare "Not connected", forever, while the
      * device still reported itself online.
      */
-    private handleLocalDisconnect(reason: string) {
+    private handleLocalDisconnect(reason: string, sourceTransport?: StdioClientTransport | null) {
         if (this.isShuttingDown) return;   // expected teardown, not a fault
-        if (!this.isReady) return;         // already handled; don't double-fire
+
+        // A close/error callback can arrive late after a replacement child is
+        // already connected. Never let an obsolete transport tear down the new
+        // client (a rare but permanent wedge without this identity check).
+        if (sourceTransport && this.mcpTransport !== sourceTransport) {
+            console.debug(`[DEBUG] Ignoring disconnect from stale local MCP transport (${reason})`);
+            return;
+        }
+
+        const wasReady = this.isReady;
+        if (!wasReady && !this.mcpClient && !this.mcpTransport) return;
+
         this.isReady = false;
         this.mcpClient = null;
         this.mcpTransport = null;
-        console.error(` - ❌ Local Desktop Commander MCP went away (${reason}); will restart on next tool call`);
+
+        // A failure while initialize() is still connecting is returned through
+        // initialize() itself; only a previously-ready child is an unexpected
+        // runtime loss that needs the device-level recovery loop.
+        if (!wasReady) return;
+
+        console.error(` - ❌ Local Desktop Commander MCP went away (${reason}); scheduling recovery`);
         void captureRemote('desktop_integration_local_disconnected', { reason });
         this.disconnectHandler?.(reason);
     }
@@ -99,13 +116,24 @@ export class DesktopCommanderIntegration {
             // running. Assigned after connect() they would REPLACE the SDK's
             // handler and an in-flight call at child death would hang until
             // the 60s request timeout instead of failing fast.
-            this.mcpTransport.onclose = () => this.handleLocalDisconnect('stdio transport closed');
+            const transport = this.mcpTransport;
+            const client = this.mcpClient;
+            this.mcpTransport.onclose = () =>
+                this.handleLocalDisconnect('stdio transport closed', transport);
             this.mcpTransport.onerror = (err: Error) =>
-                this.handleLocalDisconnect(`stdio transport error: ${err?.message ?? String(err)}`);
+                this.handleLocalDisconnect(
+                    `stdio transport error: ${err?.message ?? String(err)}`,
+                    transport
+                );
 
             // Connect to Desktop Commander
             console.debug('[DEBUG] Connecting MCP client to transport');
-            await this.mcpClient.connect(this.mcpTransport);
+            await client.connect(transport);
+            // A close may have raced connect(). Do not announce a replacement
+            // generation as ready if its transport was already invalidated.
+            if (this.mcpTransport !== transport || this.mcpClient !== client) {
+                throw new Error('Local Desktop Commander MCP disconnected during initialization');
+            }
             this.isReady = true;
 
             console.log(' - 🔌 Connected to Desktop Commander MCP');
@@ -204,35 +232,57 @@ export class DesktopCommanderIntegration {
     }
 
     async callClientTool(toolName: string, args: any, metadata?: any) {
-        // Restart the child if it died since the last call, so a one-off crash
-        // costs one failed call instead of wedging the device until a human
-        // restarts `desktop-commander remote`.
-        await this.ensureReady();
+        // The SDK's exact "Not connected" error is raised before it writes the
+        // JSON-RPC request to any transport. That makes one reconnect + retry
+        // safe. We deliberately do NOT retry "Connection closed", timeouts, or
+        // other errors because the operation may already have started.
+        for (let attempt = 0; attempt < 2; attempt++) {
+            await this.ensureReady();
 
-        // The child can die between ensureReady() resolving and the call below
-        // (handleLocalDisconnect nulls the client); surface that as a clear
-        // error instead of a TypeError on null.
-        const client = this.mcpClient;
-        if (!client) {
-            throw new Error('Local Desktop Commander MCP connection was lost while dispatching; it will be restarted on the next call');
+            // The child can die between ensureReady() resolving and dispatch.
+            const client = this.mcpClient;
+            const transport = this.mcpTransport;
+            if (!client || !transport) {
+                if (attempt === 0) {
+                    this.handleLocalDisconnect('connection lost before request dispatch', transport);
+                    continue;
+                }
+                throw new Error(
+                    'Local Desktop Commander MCP connection was lost before request dispatch'
+                );
+            }
+
+            try {
+                console.debug('[DEBUG] Calling MCP tool:', toolName, 'args:', JSON.stringify(args).substring(0, 100));
+                const result = await client.callTool({
+                    name: toolName,
+                    arguments: args,
+                    _meta: { remote: true, ...metadata || {} }
+                } as any);
+                console.debug('[DEBUG] Tool call successful:', toolName);
+                return result;
+            } catch (error: any) {
+                if (attempt === 0 && error?.message === 'Not connected') {
+                    console.warn(
+                        `⚠️ Local MCP reported "Not connected" before dispatching ${toolName}; reconnecting once`
+                    );
+                    this.handleLocalDisconnect(
+                        'SDK reported Not connected before request dispatch',
+                        transport
+                    );
+                    void captureRemote('desktop_integration_not_connected_recovery', { toolName })
+                        .catch(() => { /* recovery must not depend on telemetry */ });
+                    continue;
+                }
+
+                console.error(`Error executing tool ${toolName}:`, error);
+                console.debug('[DEBUG] Tool call error details:', error);
+                await captureRemote('desktop_integration_tool_call_failed', { error, toolName });
+                throw error;
+            }
         }
 
-        // Proxy other tools to MCP server
-        try {
-            console.debug('[DEBUG] Calling MCP tool:', toolName, 'args:', JSON.stringify(args).substring(0, 100));
-            const result = await client.callTool({
-                name: toolName,
-                arguments: args,
-                _meta: { remote: true, ...metadata || {} }
-            } as any);
-            console.debug('[DEBUG] Tool call successful:', toolName);
-            return result;
-        } catch (error) {
-            console.error(`Error executing tool ${toolName}:`, error);
-            console.debug('[DEBUG] Tool call error details:', error);
-            await captureRemote('desktop_integration_tool_call_failed', { error, toolName });
-            throw error;
-        }
+        throw new Error('Local Desktop Commander MCP recovery exhausted');
     }
 
     async listClientTools() {
