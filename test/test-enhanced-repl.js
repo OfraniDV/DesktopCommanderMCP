@@ -1,25 +1,31 @@
 import assert from 'assert';
-import { execSync } from 'child_process';
+import { spawnSync } from 'child_process';
 import { startProcess, readProcessOutput, forceTerminate, interactWithProcess } from '../dist/tools/improved-process-tools.js';
 
 /**
- * Determines the correct python command to use
- * @returns {string} 'python3' or 'python'
+ * Resolve a Python invocation without assuming a POSIX `command -v` shell.
+ * Windows commonly exposes `python.exe` or the `py -3` launcher instead.
  */
 function getPythonCommand() {
-  try {
-    // Prefer python3 if available
-    execSync('command -v python3', { stdio: 'ignore' });
-    return 'python3';
-  } catch (e) {
-    // Fallback to python
-    try {
-      execSync('command -v python', { stdio: 'ignore' });
-      return 'python';
-    } catch (error) {
-      throw new Error('Neither python3 nor python command is available in the PATH');
-    }
+  const candidates = process.platform === 'win32'
+    ? [
+        { executable: 'python', args: ['--version'], invocation: 'python' },
+        { executable: 'py', args: ['-3', '--version'], invocation: 'py -3' },
+      ]
+    : [
+        { executable: 'python3', args: ['--version'], invocation: 'python3' },
+        { executable: 'python', args: ['--version'], invocation: 'python' },
+      ];
+
+  for (const candidate of candidates) {
+    const result = spawnSync(candidate.executable, candidate.args, {
+      stdio: 'ignore',
+      shell: false,
+      windowsHide: true,
+    });
+    if (!result.error && result.status === 0) return candidate.invocation;
   }
+  throw new Error('No usable Python 3 command is available in the PATH');
 }
 
 
@@ -37,7 +43,7 @@ async function testEnhancedREPL() {
   const result = await startProcess({
     command: `${pythonCommand} -i`,
     timeout_ms: 10000,
-    shell: '/bin/bash'
+    shell: process.platform === 'win32' ? 'powershell.exe' : '/bin/bash'
   });
   
   console.log('Result from start_process:', result);

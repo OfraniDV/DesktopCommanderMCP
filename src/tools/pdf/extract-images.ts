@@ -122,8 +122,11 @@ export async function extractImagesFromPdf(
             }
         } catch (e) { /* Ignore cleanup errors */ }
         try {
-            if (typeof pdfDocument.destroy === 'function') {
-                await pdfDocument.destroy();
+            // unpdf 1.8 follows PDF.js ownership: getDocumentProxy() returns the
+            // proxy, while the loading task owns the worker/network lifecycle.
+            // Destroying the task prevents worker/resource leaks after extraction.
+            if (typeof pdfDocument.loadingTask?.destroy === 'function') {
+                await pdfDocument.loadingTask.destroy();
             }
         } catch (e) { /* Ignore cleanup errors */ }
     }
